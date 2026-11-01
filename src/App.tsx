@@ -9,6 +9,8 @@ import {
   FolderGit2,
   Image as ImageIcon,
   Layers,
+  LayoutDashboard,
+  LogOut,
   Palette,
   Plus,
   Printer,
@@ -54,11 +56,9 @@ import {
   THEME_PRESETS
 } from './services/artComposerEngine';
 import {
-  getSavedGeminiApiKey,
   runFullAiMapAutoFillAndCreate,
-  runSingleRegionAiCreate,
-  saveGeminiApiKey
-} from './services/geminiAiMapEngine';
+  runSingleRegionAiCreate
+} from './services/openAiMapEngine';
 import { analyzeUploadedPdfFile } from './services/pdfAnalyzerEngine';
 import { JsonDecoderModal } from './components/JsonDecoderModal';
 
@@ -78,6 +78,20 @@ const DEFAULT_THEME: ArtThemeConfig = {
   showTitleOverlay: true,
   referenceImages: []
 };
+
+function createUserBranch(): ProductBranch {
+  return {
+    id: crypto.randomUUID(),
+    name: 'MEU PRIMEIRO PROJETO',
+    productType: 'Sacola Nuvem',
+    createdAt: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    state: 'WAITING_PDF',
+    template: JSON.parse(JSON.stringify(OFFICIAL_TEMPLATES[0])),
+    themeConfig: { ...DEFAULT_THEME, referenceImages: [] },
+    mapConfirmed: false,
+    messages: []
+  };
+}
 
 function createInitialBranches(): ProductBranch[] {
   const sacolaTemplate = JSON.parse(JSON.stringify(OFFICIAL_TEMPLATES[0]));
@@ -219,9 +233,20 @@ const FIT_MODE_OPTIONS: { value: ImageFitMode; label: string }[] = [
   { value: 'contain', label: 'Centralizar Inteiro (Contain)' }
 ];
 
-export function App() {
-  const [branches, setBranches] = useState<ProductBranch[]>(createInitialBranches);
-  const [activeBranchId, setActiveBranchId] = useState<string>('branch-1');
+type AppProps = {
+  initialBranches: ProductBranch[];
+  userEmail: string;
+  isMaster: boolean;
+  onOpenAdmin: () => void;
+  onSignOut: () => void;
+  onProjectsChange: (projects: ProductBranch[]) => Promise<void>;
+};
+
+export function App({ initialBranches, userEmail, isMaster, onOpenAdmin, onSignOut, onProjectsChange }: AppProps) {
+  const initialRef = useRef<ProductBranch[]>(initialBranches.length ? initialBranches : [createUserBranch()]);
+  const skipInitialSave = useRef(initialBranches.length > 0);
+  const [branches, setBranches] = useState<ProductBranch[]>(initialRef.current);
+  const [activeBranchId, setActiveBranchId] = useState<string>(initialRef.current[0].id);
   const [wizardStep, setWizardStep] = useState<number>(1);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>('A');
   const [previewMode, setPreviewMode] = useState<'guide_map' | 'print_pdf' | 'proof_pdf'>('proof_pdf');
@@ -234,8 +259,7 @@ export function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [auditList, setAuditList] = useState<QualityCheckItem[]>([]);
   const [aiStatusBanner, setAiStatusBanner] = useState<string | null>(null);
-  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => getSavedGeminiApiKey());
-  const [showApiKeyConfig, setShowApiKeyConfig] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [isAiGenerating, setIsAiGenerating] = useState<boolean>(false);
   const [aiProgressText, setAiProgressText] = useState<string>('');
   const [aiProgressStep, setAiProgressStep] = useState<number>(0);
@@ -276,6 +300,16 @@ export function App() {
   const updateActiveBranch = (updater: (b: ProductBranch) => ProductBranch) => {
     setBranches(prev => prev.map(b => (b.id === activeBranch.id ? updater(b) : b)));
   };
+
+  useEffect(() => {
+    if (skipInitialSave.current) { skipInitialSave.current = false; return; }
+    const timeout = window.setTimeout(() => {
+      void onProjectsChange(branches).then(() => setSaveError(null)).catch(error => {
+        setSaveError(error instanceof Error ? error.message : 'Falha ao salvar projetos.');
+      });
+    }, 1300);
+    return () => window.clearTimeout(timeout);
+  }, [branches, onProjectsChange]);
 
   // Switch default preview mode sensibly when changing wizard steps
   useEffect(() => {
@@ -730,7 +764,6 @@ export function App() {
         template: activeBranch.template,
         refImages: combinedRefs,
         currentTheme: activeBranch.themeConfig,
-        apiKey: geminiApiKey,
         onProgress: (text, step, total) => {
           setAiProgressText(text);
           setAiProgressStep(step);
@@ -750,9 +783,9 @@ export function App() {
 
       setPreviewMode('proof_pdf');
       setAiStatusBanner(
-        result.usedRealGeminiApi
-          ? `✨ IA Gemini (3.8 Flash + Nano Banana 2.1) analisou sua referência e criou/complementou as imagens de todas as ${result.updatedRegions.length} áreas seguindo o JSON Método MAP!`
-          : `✨ Motor IA Método MAP analisou sua referência e criou/complementou imagens coordenadas exclusivas para todas as ${result.updatedRegions.length} áreas do molde!`
+        result.usedRealOpenAiApi
+          ? `✨ OpenAI analisou sua referência e criou/complementou as imagens de todas as ${result.updatedRegions.length} áreas seguindo o JSON Método MAP!`
+          : `Composição local aplicada às ${result.updatedRegions.length} áreas do molde. A geração OpenAI não ficou disponível nesta tentativa.`
       );
     } finally {
       setIsAiGenerating(false);
@@ -857,7 +890,6 @@ export function App() {
         template: activeBranch.template,
         refImages: refs,
         currentTheme: activeBranch.themeConfig,
-        apiKey: geminiApiKey,
         onProgress: (text, step, total) => {
           setAiProgressText(text);
           setAiProgressStep(step);
@@ -877,9 +909,9 @@ export function App() {
 
       setPreviewMode('proof_pdf');
       setAiStatusBanner(
-        result.usedRealGeminiApi
-          ? `✨ IA Gemini (3.8 Flash + Nano Banana 2.1) analisou a referência e criou/complementou todas as áreas (${result.updatedRegions.map(r => r.id).join(', ')}) respeitando o JSON Método MAP!`
-          : `✨ Motor IA Método MAP analisou a referência e criou/complementou artes exclusivas para todas as áreas (${result.updatedRegions.map(r => r.id).join(', ')}) seguindo o JSON Método MAP!`
+        result.usedRealOpenAiApi
+          ? `✨ OpenAI analisou a referência e criou/complementou todas as áreas (${result.updatedRegions.map(r => r.id).join(', ')}) respeitando o JSON Método MAP!`
+          : `Composição local aplicada às áreas ${result.updatedRegions.map(r => r.id).join(', ')}. A geração OpenAI não ficou disponível nesta tentativa.`
       );
     } finally {
       setIsAiGenerating(false);
@@ -907,7 +939,6 @@ export function App() {
         template: activeBranch.template,
         refImages: refs,
         currentTheme: activeBranch.themeConfig,
-        apiKey: geminiApiKey
       });
 
       updateActiveBranch(b => {
@@ -1111,7 +1142,7 @@ export function App() {
   const handleCreateBranch = () => {
     const idx = branches.length + 1;
     const newBranch: ProductBranch = {
-      id: `branch-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: `PRODUTO ${idx}`,
       productType: 'Novo Molde',
       createdAt: nowTime(),
@@ -1230,6 +1261,8 @@ export function App() {
 
           {/* Right Utility Actions (Tucked cleanly away) */}
           <div className="flex items-center gap-2">
+            {saveError && <span role="alert" className="max-w-24 truncate text-xs font-semibold text-rose-700 sm:max-w-40" title={saveError}>Erro ao salvar</span>}
+            {isMaster && <button onClick={() => { void onProjectsChange(branches).then(onOpenAdmin).catch(error => setSaveError(error instanceof Error ? error.message : 'Falha ao salvar projetos.')); }} className="flex items-center gap-1.5 rounded-xl border border-orange-200 bg-orange-50 px-3 py-1.5 text-xs font-bold text-orange-800 transition hover:bg-orange-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-orange-600"><LayoutDashboard className="h-3.5 w-3.5" />Painel master</button>}
             <button
               onClick={() => setIsChatDrawerOpen(true)}
               className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 border border-slate-200 text-xs font-semibold flex items-center gap-1.5 transition"
@@ -1244,6 +1277,8 @@ export function App() {
             >
               <FileCode2 className="w-4 h-4 text-slate-600" />
             </button>
+            <span className="hidden max-w-36 truncate text-xs text-slate-500 xl:block" title={userEmail}>{userEmail}</span>
+            <button onClick={() => { void onProjectsChange(branches).then(onSignOut).catch(error => setSaveError(error instanceof Error ? error.message : 'Falha ao salvar projetos.')); }} className="rounded-xl border border-slate-200 p-2 text-slate-600 transition hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-orange-600" title="Sair da conta" aria-label="Sair da conta"><LogOut className="h-4 w-4" /></button>
           </div>
         </div>
 
@@ -1703,17 +1738,7 @@ export function App() {
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        onClick={() => setShowApiKeyConfig(prev => !prev)}
-                        className={`px-3 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1.5 transition ${
-                          geminiApiKey
-                            ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                            : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
-                        }`}
-                      >
-                        <Cpu className="w-3.5 h-3.5" />
-                        {geminiApiKey ? 'API Gemini Conectada ✓' : 'Configurar Chave API Gemini'}
-                      </button>
+                      <span className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[11px] font-bold text-emerald-800"><ShieldCheck className="h-3.5 w-3.5" />OpenAI via servidor seguro</span>
                       <button
                         onClick={() => multiRefInputRef.current?.click()}
                         className="px-3.5 py-2 rounded-xl bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
@@ -1724,40 +1749,7 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* Optional Gemini API Key & AI Creative Controls */}
-                  {showApiKeyConfig && (
-                    <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-bold text-slate-800">
-                          Chave da API Google Gemini (`gemini-3.8-flash` + `gemini-nano-banana-2.1`)
-                        </label>
-                        <span className="text-[10px] font-mono text-slate-500">
-                          Salva localmente no navegador
-                        </span>
-                      </div>
-                      <div className="flex gap-2">
-                        <input
-                          type="password"
-                          value={geminiApiKey}
-                          onChange={e => {
-                            setGeminiApiKey(e.target.value);
-                            saveGeminiApiKey(e.target.value);
-                          }}
-                          placeholder="Cole sua GEMINI_API_KEY (AIzaSy...) para geração em nuvem com Nano Banana 2.1"
-                          className="flex-1 bg-white border border-slate-300 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-800"
-                        />
-                        <button
-                          onClick={() => setShowApiKeyConfig(false)}
-                          className="px-3 py-1.5 rounded-xl bg-slate-800 text-white text-xs font-bold"
-                        >
-                          Salvar
-                        </button>
-                      </div>
-                      <p className="text-[11px] text-slate-500">
-                        Com chave configurada, usa <strong>Gemini 3.8 Flash</strong> para planejar o JSON Método MAP e <strong>Gemini Nano Banana 2.1</strong> para gerar novas imagens. Sem chave, usa o <strong>Sintetizador Neural Local MAP</strong> que cria papéis secundários, laterais, barrados e toppers a partir dos pixels e paleta da sua referência!
-                      </p>
-                    </div>
-                  )}
+                  <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-[11px] leading-5 text-slate-600">O planejamento usa um modelo GPT e a geração usa GPT Image. A chave OpenAI fica protegida no Supabase; se o serviço estiver indisponível, o estúdio usa a composição local.</p>
 
                   {/* AI Strategy & Creative Prompt Controls */}
                   <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 p-3.5 rounded-xl bg-orange-50/40 border border-orange-200/80">

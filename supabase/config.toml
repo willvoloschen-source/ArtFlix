@@ -1,0 +1,4 @@
+project_id = "zjvpbzfisamnodfpoujs"
+
+[functions.artflix-ai]
+verify_jwt = true
