@@ -47,6 +47,25 @@ O código decodificado completo encontra-se salvo em [`docs/Metodo-MAP.decodific
 ## 3. Como Executar Localmente
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
+
+Use `Abrir_ArtFlix_Studio.bat` no Windows. Como a instalação do npm pode travar na pasta sincronizada do Google Drive, o atalho copia a versão atual para `%TEMP%\ArtFlixStudio\run`, instala as dependências ali e abre a aplicação em `http://127.0.0.1:5173/`. Execute o atalho novamente após alterar os arquivos da pasta G:. O antigo HTML independente foi substituído por uma página de entrada para a aplicação autenticada; seu conteúdo anterior permanece recuperável no histórico do Git.
+
+## 4. Contas, projetos privados e IA
+
+O aplicativo Vite usa Supabase Auth, a tabela `artflix_profiles` para aprovações e `artflix_projects` para os documentos. As imagens e prévias de PDF ficam no bucket privado `artflix-assets`. As políticas RLS permitem que cada usuário ativo acesse apenas seus próprios projetos e arquivos. O painel de acessos aparece somente ao perfil `master`.
+
+1. Copie `.env.example` para `.env.local`. A URL e a chave **publicável** do projeto `ArtFlixDB` já estão indicadas no exemplo. Nunca coloque a chave `service_role` ou a chave OpenAI em variáveis `VITE_`.
+2. A migração `supabase/migrations/20261101192831_artflix_accounts_projects.sql` já foi aplicada ao projeto `zjvpbzfisamnodfpoujs`, e a função `supabase/functions/artflix-ai` já foi implantada com verificação JWT ativa.
+3. Configure `OPENAI_API_KEY` como segredo da Edge Function no Supabase. Por padrão, o planejamento usa `gpt-6.1-terra` e a geração de imagens usa `gpt-image-2.5-flare`. Os modelos podem ser alterados com os segredos `OPENAI_TEXT_MODEL` e `OPENAI_IMAGE_MODEL`.
+4. Cadastre `willvoloschen@gmail.com` e confirme o e-mail. Depois execute, uma única vez, o comando abaixo no SQL Editor do projeto para ativar o administrador master. O e-mail sozinho não concede privilégios.
+
+```sql
+update public.artflix_profiles set role = 'master', active = true
+where email = 'willvoloschen@gmail.com'
+  and id in (select id from auth.users where email_confirmed_at is not null);
+```
+
+Os novos cadastros ficam pendentes até aprovação no painel master. Se a chamada à OpenAI falhar, o estúdio usa o mecanismo local de composição e informa o resultado no fluxo da criação.

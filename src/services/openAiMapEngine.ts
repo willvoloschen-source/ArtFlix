@@ -8,24 +8,7 @@ import {
   RegionFunction
 } from '../types/mapTypes';
 import { extractPaletteFromImage, loadImageCached } from './artComposerEngine';
-
-const GEMINI_STORAGE_KEY = 'artflix_gemini_api_key';
-
-export function getSavedGeminiApiKey(): string {
-  try {
-    return localStorage.getItem(GEMINI_STORAGE_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-export function saveGeminiApiKey(key: string): void {
-  try {
-    localStorage.setItem(GEMINI_STORAGE_KEY, key.trim());
-  } catch {
-    // ignore storage errors
-  }
-}
+import { supabase } from './supabaseClient';
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } | null {
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
@@ -37,10 +20,10 @@ function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string }
 }
 
 /**
- * Selects the closest supported aspect ratio for gemini-nano-banana-2.1
+ * Selects the closest practical aspect ratio for generated region art.
  * Supported: "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
  */
-export function selectNanoBananaAspectRatio(bbox: { w: number; h: number }): string {
+export function selectRegionAspectRatio(bbox: { w: number; h: number }): string {
   const ratio = (bbox.w || 100) / Math.max(1, bbox.h || 100);
   const candidates: Array<{ label: string; value: number }> = [
     { label: '1:4', value: 0.25 },
@@ -66,56 +49,6 @@ export function selectNanoBananaAspectRatio(bbox: { w: number; h: number }): str
     }
   }
   return best.label;
-}
-
-function extractTextFromInteractionResponse(respJson: any): string {
-  if (!respJson) return '';
-  if (typeof respJson.output_text === 'string' && respJson.output_text.trim()) {
-    return respJson.output_text.trim();
-  }
-  const interaction = respJson.interaction || respJson;
-  if (typeof interaction.output_text === 'string' && interaction.output_text.trim()) {
-    return interaction.output_text.trim();
-  }
-  if (Array.isArray(interaction.steps)) {
-    for (let i = interaction.steps.length - 1; i >= 0; i--) {
-      const step = interaction.steps[i];
-      if (step?.type === 'model_output' && Array.isArray(step.content)) {
-        const texts = step.content
-          .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
-          .map((c: any) => c.text);
-        if (texts.length > 0) return texts.join('\n').trim();
-      }
-    }
-  }
-  return '';
-}
-
-function extractImageFromInteractionResponse(respJson: any): { data: string; mimeType: string } | null {
-  if (!respJson) return null;
-  const interaction = respJson.interaction || respJson;
-  if (interaction.output_image && interaction.output_image.data) {
-    return {
-      data: interaction.output_image.data,
-      mimeType: interaction.output_image.mime_type || interaction.output_image.mimeType || 'image/png'
-    };
-  }
-  if (Array.isArray(interaction.steps)) {
-    for (let i = interaction.steps.length - 1; i >= 0; i--) {
-      const step = interaction.steps[i];
-      if (step?.type === 'model_output' && Array.isArray(step.content)) {
-        for (const block of step.content) {
-          if (block?.type === 'image' && block.data) {
-            return {
-              data: block.data,
-              mimeType: block.mime_type || block.mimeType || 'image/png'
-            };
-          }
-        }
-      }
-    }
-  }
-  return null;
 }
 
 /**
@@ -151,11 +84,10 @@ export function buildDefaultRegionPrompt(
 }
 
 /**
- * Step 1 of Real AI: Uses gemini-3.8-flash with multimodal reference images + Método MAP JSON rules
+ * Plans the composition with an authenticated OpenAI call through Supabase.
  * to analyze the reference image(s) and plan the exact composition map for every region (A, B, C...).
  */
-export async function analyzeReferenceAndPlanMapWithGemini(params: {
-  apiKey: string;
+export async function analyzeReferenceAndPlanMapWithOpenAi(params: {
   template: OfficialTemplateSpec;
   regions: DetectedRegion[];
   refImages: ReferenceImageItem[];
@@ -167,7 +99,7 @@ export async function analyzeReferenceAndPlanMapWithGemini(params: {
   nameOutlineColor: string;
   regionsPlan: AiRegionPlanItem[];
 }> {
-  const { apiKey, template, regions, refImages, currentTheme } = params;
+  const { template, regions, refImages, currentTheme } = params;
 
   const systemInstruction = `Você é o Motor Inteligente Oficial do Método MAP (schema: "metodo-map.chatbot.initializer.v2").
 Sua missão é analisar as imagens de referência enviadas pelo usuário e planejar o preenchimento e a criação de imagens complementares para TODAS as áreas geométricas (${regions.map(r => r.id).join(', ')}) do molde oficial "${template.name}" (${template.widthMm}x${template.heightMm}mm).
@@ -187,7 +119,7 @@ Para cada região do molde, defina:
 - mapRecordFormatted: registro formal exato no padrão "Área [ID] ([Cor]) → [Função] → [Conteúdo] → [Posição e Orientação] → [Sobreposição]".
 - fitMode: "cover" para papéis digitais/fundos/laterais/barrados com sangria, "contain" para personagens isolados/apliques.
 - action: "create_complementary_ai" quando a IA deve criar/complementar uma imagem sob medida para aquela área seguindo a referência, ou "use_reference" quando a área deve usar a própria imagem de referência principal.
-- imageGenerationPrompt: prompt detalhado para o modelo de imagem (gemini-nano-banana-2.1) criar/complementar a imagem daquela área em perfeita harmonia com a imagem de referência enviada.`;
+- imageGenerationPrompt: prompt detalhado para o modelo GPT Image criar/complementar a imagem daquela área em perfeita harmonia com a imagem de referência enviada.`;
 
   const regionsDescription = regions
     .map(
@@ -221,6 +153,7 @@ ${regionsDescription}`
 
   const schema = {
     type: 'object',
+    additionalProperties: false,
     properties: {
       themeDetected: { type: 'string' },
       paletteHex: {
@@ -233,6 +166,7 @@ ${regionsDescription}`
         type: 'array',
         items: {
           type: 'object',
+          additionalProperties: false,
           properties: {
             regionId: { type: 'string' },
             assignedFunction: { type: 'string' },
@@ -257,47 +191,25 @@ ${regionsDescription}`
     required: ['themeDetected', 'paletteHex', 'namePrimaryColor', 'nameOutlineColor', 'regionsPlan']
   };
 
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-      'Api-Revision': '2026-05-20'
-    },
-    body: JSON.stringify({
-      model: 'gemini-3.8-flash',
-      system_instruction: systemInstruction,
-      input: inputParts,
-      response_format: {
-        type: 'text',
-        mime_type: 'application/json',
-        schema
-      }
-    })
+  if (!supabase) throw new Error('Supabase não configurado.');
+  const { data, error } = await supabase.functions.invoke('artflix-ai', {
+    body: { action: 'plan', systemInstruction, inputParts, schema }
   });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini 3.8 Flash API error (${response.status}): ${errText.slice(0, 200)}`);
-  }
-
-  const respJson = await response.json();
-  const rawText = extractTextFromInteractionResponse(respJson);
-  const parsed = JSON.parse(rawText);
-  return parsed;
+  if (error) throw new Error(`OpenAI: ${error.message}`);
+  if (!data?.plan) throw new Error('O modelo não retornou o plano de composição.');
+  return data.plan;
 }
 
 /**
- * Step 2 of Real AI: Uses gemini-nano-banana-2.1 (Nano Banana 2.1) with the user's reference image(s)
+ * Generates art with GPT Image through the authenticated Supabase function.
  * and the region-specific prompt to generate a complementary image tailored to that region's function & aspect ratio.
  */
-export async function generateComplementaryRegionImageWithGemini(params: {
-  apiKey: string;
+export async function generateComplementaryRegionImageWithOpenAi(params: {
   prompt: string;
   refImages: ReferenceImageItem[];
   aspectRatio: string;
 }): Promise<string> {
-  const { apiKey, prompt, refImages, aspectRatio } = params;
+  const { prompt, refImages, aspectRatio } = params;
 
   const inputParts: any[] = [
     {
@@ -306,7 +218,7 @@ export async function generateComplementaryRegionImageWithGemini(params: {
     }
   ];
 
-  // Attach up to 3 reference images for Nano Banana 2.1 multi-image reference fusion
+  // Attach up to 3 reference images.
   for (const ref of refImages.filter(r => !r.isAiGenerated).slice(0, 3)) {
     const parsed = parseDataUrl(ref.dataUrl);
     if (parsed) {
@@ -318,35 +230,13 @@ export async function generateComplementaryRegionImageWithGemini(params: {
     }
   }
 
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-      'Api-Revision': '2026-05-20'
-    },
-    body: JSON.stringify({
-      model: 'gemini-nano-banana-2.1',
-      input: inputParts,
-      response_format: {
-        type: 'image',
-        mime_type: 'image/png',
-        aspect_ratio: aspectRatio
-      }
-    })
+  if (!supabase) throw new Error('Supabase não configurado.');
+  const { data, error } = await supabase.functions.invoke('artflix-ai', {
+    body: { action: 'image', inputParts, aspectRatio }
   });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini Nano Banana 2.1 error (${response.status}): ${errText.slice(0, 200)}`);
-  }
-
-  const respJson = await response.json();
-  const imgObj = extractImageFromInteractionResponse(respJson);
-  if (!imgObj || !imgObj.data) {
-    throw new Error('Modelo não retornou bytes de imagem.');
-  }
-  return `data:${imgObj.mimeType};base64,${imgObj.data}`;
+  if (error) throw new Error(`OpenAI: ${error.message}`);
+  if (!data?.imageDataUrl) throw new Error('O modelo não retornou uma imagem.');
+  return data.imageDataUrl;
 }
 
 /**
@@ -609,8 +499,7 @@ export async function synthesizeComplementaryRegionImageFromReference(params: {
 /**
  * Full AI Orchestrator:
  * 1. Extracts/merges color palette from reference image(s).
- * 2. If Gemini API Key is present, calls `gemini-3.8-flash` to plan the complete Método MAP JSON
- *    across all regions (A, B, C...) AND calls `gemini-nano-banana-2.1` to generate/complement the images
+ * 2. Calls the protected OpenAI function to plan and generate region art when available.
  *    for each region using the reference image(s).
  * 3. If no API Key is configured (or if a region falls back), uses the Neural Reference Complement Synthesizer
  *    to create distinct, harmonious images from the reference for every region (A, B, C...) respecting the Método MAP JSON!
@@ -619,16 +508,14 @@ export async function runFullAiMapAutoFillAndCreate(params: {
   template: OfficialTemplateSpec;
   refImages: ReferenceImageItem[];
   currentTheme: ArtThemeConfig;
-  apiKey?: string;
   onProgress?: (statusText: string, stepIndex: number, totalSteps: number) => void;
 }): Promise<{
   updatedRegions: DetectedRegion[];
   updatedTheme: ArtThemeConfig;
-  usedRealGeminiApi: boolean;
+  usedRealOpenAiApi: boolean;
   mapRecords: string[];
 }> {
-  const { template, refImages, currentTheme, apiKey, onProgress } = params;
-  const cleanKey = (apiKey ?? getSavedGeminiApiKey()).trim();
+  const { template, refImages, currentTheme, onProgress } = params;
 
   const userSourceRefs = refImages.filter(r => !r.isAiGenerated);
   const effectiveRefs = userSourceRefs.length > 0 ? userSourceRefs : refImages;
@@ -637,7 +524,7 @@ export async function runFullAiMapAutoFillAndCreate(params: {
     return {
       updatedRegions: template.regions,
       updatedTheme: currentTheme,
-      usedRealGeminiApi: false,
+      usedRealOpenAiApi: false,
       mapRecords: []
     };
   }
@@ -674,17 +561,17 @@ export async function runFullAiMapAutoFillAndCreate(params: {
     regionsPlan: AiRegionPlanItem[];
   } | null = null;
 
-  let usedRealGeminiApi = false;
+  let usedRealOpenAiApi = false;
+  let openAiImageCount = 0;
 
-  if (cleanKey) {
+  if (supabase) {
     try {
       onProgress?.(
-        '2. Consultando Gemini 3.8 Flash (Visão Multimodal + Mapeamento Geométrico JSON Método MAP)...',
+        '2. Consultando OpenAI (visão multimodal e mapa geométrico Método MAP)...',
         2,
         totalSteps
       );
-      aiPlan = await analyzeReferenceAndPlanMapWithGemini({
-        apiKey: cleanKey,
+      aiPlan = await analyzeReferenceAndPlanMapWithOpenAi({
         template,
         regions,
         refImages: effectiveRefs,
@@ -693,7 +580,7 @@ export async function runFullAiMapAutoFillAndCreate(params: {
       if (aiPlan && Array.isArray(aiPlan.paletteHex) && aiPlan.paletteHex.length >= 2) {
         mergedPalette = aiPlan.paletteHex;
       }
-      usedRealGeminiApi = true;
+      usedRealOpenAiApi = true;
     } catch (err) {
       console.warn('Fallback para planejador Método MAP local:', err);
     }
@@ -736,7 +623,7 @@ export async function runFullAiMapAutoFillAndCreate(params: {
       (assignedFn === 'personagem' ? 'contain' : 'cover');
 
     onProgress?.(
-      `${i + 3}. Criando e complementando imagem com IA para a Área ${reg.id} (${assignedFn.replace(/_/g, ' ').toUpperCase()})...`,
+      `${i + 3}. Preparando arte para a Área ${reg.id} (${assignedFn.replace(/_/g, ' ').toUpperCase()})...`,
       i + 3,
       totalSteps
     );
@@ -758,18 +645,18 @@ export async function runFullAiMapAutoFillAndCreate(params: {
       finalDataUrl = chosen.dataUrl;
       finalAssetName = `${chosen.name} (Referência Base · Área ${reg.id})`;
       isAiCreated = false;
-    } else if (cleanKey) {
+    } else if (supabase) {
       try {
-        const aspectRatio = selectNanoBananaAspectRatio(reg.bbox);
-        finalDataUrl = await generateComplementaryRegionImageWithGemini({
-          apiKey: cleanKey,
+        const aspectRatio = selectRegionAspectRatio(reg.bbox);
+        finalDataUrl = await generateComplementaryRegionImageWithOpenAi({
           prompt: promptForRegion,
           refImages: effectiveRefs,
           aspectRatio
         });
-        finalAssetName = `IA Gemini Nano Banana · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
+        finalAssetName = `GPT Image · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
         isAiCreated = true;
-        usedRealGeminiApi = true;
+        usedRealOpenAiApi = true;
+        openAiImageCount++;
       } catch (err) {
         console.warn(`Fallback de síntese para Área ${reg.id}:`, err);
         finalDataUrl = await synthesizeComplementaryRegionImageFromReference({
@@ -779,7 +666,7 @@ export async function runFullAiMapAutoFillAndCreate(params: {
           palette: mergedPalette,
           themeName: aiPlan?.themeDetected || currentTheme.themeName
         });
-        finalAssetName = `IA Complementar MAP · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
+        finalAssetName = `Composição local MAP · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
         isAiCreated = true;
       }
     } else {
@@ -791,14 +678,14 @@ export async function runFullAiMapAutoFillAndCreate(params: {
         palette: mergedPalette,
         themeName: currentTheme.themeName
       });
-      finalAssetName = `IA Complementar MAP · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
+      finalAssetName = `Composição local MAP · Área ${reg.id} (${assignedFn.replace(/_/g, ' ')})`;
       isAiCreated = true;
     }
 
     const assignedContentText =
       planItem?.assignedContent ||
       (isAiCreated
-        ? `Arte complementar criada por IA seguindo referência (${finalAssetName})`
+        ? `${finalAssetName.startsWith('GPT Image') ? 'Arte gerada pela OpenAI' : 'Composição local'} seguindo referência (${finalAssetName})`
         : `Imagem de referência aplicada (${finalAssetName})`);
 
     const mapRecord =
@@ -847,15 +734,15 @@ export async function runFullAiMapAutoFillAndCreate(params: {
     nameOutlineColor: aiPlan?.nameOutlineColor || mergedPalette[1] || currentTheme.nameOutlineColor,
     referenceImages: [...effectiveRefs, ...generatedGalleryItems],
     aiMapRecords: mapRecords,
-    aiLastSummary: usedRealGeminiApi
-      ? `Gemini 3.8 Flash + Nano Banana 2.1 analisaram a referência e criaram/complementaram ${updatedRegions.length} áreas (${updatedRegions.map(r => r.id).join(', ')}) seguindo o JSON Método MAP.`
-      : `Motor IA Método MAP analisou a referência e sintetizou/complementou ${updatedRegions.length} artes coordenadas para as áreas (${updatedRegions.map(r => r.id).join(', ')}) respeitando o JSON Método MAP.`
+    aiLastSummary: usedRealOpenAiApi
+      ? `OpenAI gerou ${openAiImageCount} de ${updatedRegions.length} artes; as demais foram compostas localmente ou usaram a referência. Áreas: ${updatedRegions.map(r => r.id).join(', ')}.`
+      : `A composição local sintetizou ${updatedRegions.length} artes coordenadas para as áreas (${updatedRegions.map(r => r.id).join(', ')}) respeitando o JSON Método MAP.`
   };
 
   return {
     updatedRegions,
     updatedTheme: nextTheme,
-    usedRealGeminiApi,
+    usedRealOpenAiApi,
     mapRecords
   };
 }
@@ -870,14 +757,12 @@ export async function runSingleRegionAiCreate(params: {
   refImages: ReferenceImageItem[];
   currentTheme: ArtThemeConfig;
   customUserPrompt?: string;
-  apiKey?: string;
 }): Promise<{
   updatedRegion: DetectedRegion;
   generatedRefItem: ReferenceImageItem;
-  usedRealGeminiApi: boolean;
+  usedRealOpenAiApi: boolean;
 }> {
-  const { region, regionIndex, template, refImages, currentTheme, customUserPrompt, apiKey } = params;
-  const cleanKey = (apiKey ?? getSavedGeminiApiKey()).trim();
+  const { region, regionIndex, template, refImages, currentTheme, customUserPrompt } = params;
   const baseRefs = refImages.filter(r => !r.isAiGenerated);
   const effectiveRefs = baseRefs.length > 0 ? baseRefs : refImages;
 
@@ -898,18 +783,17 @@ export async function runSingleRegionAiCreate(params: {
   );
 
   let dataUrl = '';
-  let usedRealGeminiApi = false;
+  let usedRealOpenAiApi = false;
 
-  if (cleanKey && effectiveRefs.length > 0) {
+  if (supabase && effectiveRefs.length > 0) {
     try {
-      const aspectRatio = selectNanoBananaAspectRatio(region.bbox);
-      dataUrl = await generateComplementaryRegionImageWithGemini({
-        apiKey: cleanKey,
+      const aspectRatio = selectRegionAspectRatio(region.bbox);
+      dataUrl = await generateComplementaryRegionImageWithOpenAi({
         prompt,
         refImages: effectiveRefs,
         aspectRatio
       });
-      usedRealGeminiApi = true;
+      usedRealOpenAiApi = true;
     } catch (err) {
       console.warn(`Fallback de síntese individual para Área ${region.id}:`, err);
     }
@@ -925,9 +809,9 @@ export async function runSingleRegionAiCreate(params: {
     });
   }
 
-  const assetName = usedRealGeminiApi
-    ? `IA Gemini Nano Banana · Área ${region.id} (${region.assignedFunction.replace(/_/g, ' ')})`
-    : `IA Complementar MAP · Área ${region.id} (${region.assignedFunction.replace(/_/g, ' ')})`;
+  const assetName = usedRealOpenAiApi
+    ? `GPT Image · Área ${region.id} (${region.assignedFunction.replace(/_/g, ' ')})`
+    : `Composição local MAP · Área ${region.id} (${region.assignedFunction.replace(/_/g, ' ')})`;
 
   const mapRecord = `Área ${region.id} (${region.colorName}) → ${region.assignedFunction} → ${assetName} → ${region.positionAndOrientation} → ${region.overlaps}`;
 
@@ -946,7 +830,7 @@ export async function runSingleRegionAiCreate(params: {
     ...region,
     customAssetDataUrl: dataUrl,
     customAssetName: assetName,
-    assignedContent: `Arte complementar criada por IA (${assetName})`,
+    assignedContent: `${usedRealOpenAiApi ? 'Arte gerada pela OpenAI' : 'Composição local'} (${assetName})`,
     aiPromptUsed: prompt,
     aiMapRecord: mapRecord,
     isAiCreated: true
@@ -955,6 +839,6 @@ export async function runSingleRegionAiCreate(params: {
   return {
     updatedRegion,
     generatedRefItem,
-    usedRealGeminiApi
+    usedRealOpenAiApi
   };
 }

@@ -7,8 +7,12 @@ export default {
   theme: {
     extend: {
       colors: {
+        orange: {
+          500: '#b64c1e',
+          600: '#9f3f15'
+        },
         map: {
-          orange: '#F97316',
+          orange: '#b64c1e',
           gold: '#F59E0B',
           dark: '#0B0F17',
           panel: '#111827',
